@@ -1,12 +1,12 @@
 'use strict';
 
 /*
-	This is a pre-written test-case wrapper
-	for local module development. Populate
-	../test.jsonnet with tests of your
-	module capabilities.
+    This is a pre-written test-case wrapper
+    for local module development. Populate
+    ../test.jsonnet with tests of your
+    module capabilities.
 
-	Run with `npm run test`
+    Run with `npm run test`
 */
 
 const fs = require('fs');
@@ -33,7 +33,7 @@ const spellframe = new SpellFrame();
         // This ensures the native functions are registered as "@scope/pkg:func", 
         // matching the std.native() calls in your libsonnet.
         spellframe.loadPlugin(pkg.name, jsEntry);
-        
+
         // 4. Initialize
         await spellframe.init();
 

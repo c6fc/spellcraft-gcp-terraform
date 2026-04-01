@@ -3,6 +3,8 @@
 
 local auth = import "@c6fc/spellcraft-gcp-auth/module.libsonnet";
 
+local projectMetadata = auth.getProjectMetadata();
+
 local normalize(name) = std.native("@c6fc/spellcraft-gcp-terraform:normalizeResourceName")(name);
 local shortHash(name) = std.native("@c6fc/spellcraft-gcp-terraform:shortHash")(std.manifestJsonEx(name, ''));
 
@@ -14,35 +16,64 @@ local join_objects(objs) =
 			aux(arr, i + 1, std.mergePatch(running, arr[i])) tailstrict;
 	aux(objs, 0, {});
 
-local org_map(name, anchor, fullbody) =
+local org_map(name, region, anchor, fullbody) =
 	local recurse(parent, resource, rawbody) = 
-		// Pre-define and hide interpreted to avoid lots of conditionals.
+		// Pre-define and hide interpreted values to avoid lots of conditionals.
 		local body = {
 			type:: "",
 			iam_members:: [],
 			services:: [],
-			service_accounts:: [],
-			audit_config:: [],
+			service_accounts:: {},
+			audit_config:: {},
 			constraints:: [],
-			custom_constraints:: [],
 			custom_roles:: [],
 			children:: [],
-		} + rawbody;
+			provider_regions:: []
+		} + rawbody + {
+			services:: std.filter(function(x) x != "", std.uniq(std.sort(super.services + [
+				if std.objectHas(rawbody, "iam_members") then "iam.googleapis.com" else "",
+				if std.objectHas(rawbody, "service_accounts") then "iam.googleapis.com" else "",
+				if std.objectHas(rawbody, "audit_config") then "iam.googleapis.com" else "",
+				if std.objectHas(rawbody, "constraints") then "orgpolicy.googleapis.com" else "",
+				if std.objectHas(rawbody, "custom_constraints") then "orgpolicy.googleapis.com" else "",
+				if std.objectHas(rawbody, "custom_roles") then "iam.googleapis.com" else "",
+			])))
+		};
 
 		local thisResource = normalize("%s_%s" % [resource, body.name]);
 
 		local gParent = if (body.type == "project") then
 				"projects/${google_project.%s.project_id}" % thisResource
 			else
-				"${google_folder.%s.name}" % thisResource;
+				"folders/${google_folder.%s.folder_id}" % thisResource;
 
 		std.mergePatch(std.prune({
+			provider: (if body.type == "project" then [{
+				google: {
+					project: "${google_project.%s.project_id}" % thisResource,
+					alias: body.name,
+					region: region
+				}
+			}, {
+				google: {
+					project: "${google_project.%s.project_id}" % thisResource,
+					alias: "%s-%s" % [body.name, region],
+					region: region
+				}
+			}] + [{
+				google: {
+					project: "${google_project.%s.project_id}" % thisResource,
+					alias: "%s-%s" % [body.name, r],
+					region: r
+				}
+			} for r in body.provider_regions] else []),
 			resource: {
 				[if body.type == "project" then 'google_project' else null]: {
 					[thisResource]: {
-						name: body.name,
-						project_id: body.name,
-						deletion_protection: false,
+						deletion_policy: "DELETE",
+						billing_account: projectMetadata.billingAccount,
+					} + body + {
+						project_id: "%s-%s" % [normalize(body.name), shortHash(body + parent)],
 
 						[if std.startsWith(parent, "organizations/") then 'org_id' else null]: std.split(parent, "/")[1],
 						[if std.startsWith(parent, "folders/") then 'folder_id' else null]: std.split(parent, "/")[1],
@@ -50,22 +81,17 @@ local org_map(name, anchor, fullbody) =
 				},
 
 				[if body.type == "folder" then 'google_folder' else null]: {
-					[thisResource]: body + {
-						project_id: body.name,
+					[thisResource]: {
+						name:: "",
+					} + body + {
+						display_name: body.name,
 						parent: parent,
-						deletion_protection: false,
+						deletion_protection: false
 					}
 				},
 
-				[if (body.type == "project") then 'google_project_iam_member' else 'google_folder_iam_member']: {
-					["%s-iam-%s-%s" % [thisResource, normalize(item.role), shortHash(item)]]: item + {
-						[if body.type == "project" then 'project' else null]: "${google_project.%s.project_id}" % thisResource,
-						[if body.type == "folder" then 'folder' else null]: "${google_folder.%s.name}" % thisResource,
-					} for item in body.iam_members
-				},
-
-				google_project_services: {
-					["%s-services-%s" % [thisResource, service]]: {
+				[if body.type == "project" then 'google_project_service' else null]: {
+					["%s-services-%s" % [thisResource, std.split(service, ".")[0]]]: {
 						project: "${google_project.%s.project_id}" % thisResource,
 						service: service,
 						disable_on_destroy: false,
@@ -73,8 +99,58 @@ local org_map(name, anchor, fullbody) =
 					} for service in body.services
 				},
 
+				[if body.type == "project" then 'google_project_iam_member' else 'google_folder_iam_member']: {
+					["%s-member-%s" % [thisResource, shortHash(item + member)]]: {
+						
+						[if body.type == "project" then 'project' else null]: "${google_project.%s.project_id}" % thisResource,
+						[if body.type == "folder" then 'folder' else null]: "${google_folder.%s.name}" % thisResource,
+						
+						role: item.role,
+						member: member
+					} for item in body.iam_members for member in item.members
+				} + {
+					["%s-sa-permissions-%s-%s" % [thisResource, normalize(sa), shortHash(sa+entry)]]: (if std.type(entry) == "string" then {
+						role: entry
+					} else entry) + {
+						role: (if std.startsWith(super.role, "custom/") then "projects/${google_project.%s.project_id}/roles/%s" % [thisResource, std.split(super.role, "/")[1]] else super.role),
+						project: "${google_project.%s.project_id}" % thisResource,
+						member: "serviceAccount:${google_service_account.%s-sa-%s.email}" % [thisResource, normalize(sa)],
+					}
+					for sa in std.objectFields(body.service_accounts)
+					for entry in (if std.objectHas(body.service_accounts[sa], 'identity_policies') then body.service_accounts[sa].identity_policies else [])
+				},
+
+				[if body.type == "project" then 'google_project_iam_audit_config' else 'google_folder_iam_audit_config']: {
+					["%s-audit-%s" % [thisResource, normalize(std.split(k, ".")[0])]]: {
+						
+						[if body.type == "project" then 'project' else null]: "${google_project.%s.project_id}" % thisResource,
+						[if body.type == "folder" then 'folder' else null]: "${google_folder.%s.name}" % thisResource,
+						
+						service: k,
+						audit_log_config: std.map(
+							function(e) (if std.type(e) == "string" then {
+								log_type: e
+							} else e),
+							body.audit_config[k].log_types
+						)
+					} for k in std.objectFields(body.audit_config)
+				},
+
+				[if body.type == "project" then 'google_project_iam_custom_role' else null]: {
+					["%s-customrole-%s" % [thisResource, role]]: body.custom_roles[role] + {
+						
+						// Fail if the name contains underscores. I agree this is a dumb limitation
+						local failWithUnderscores = std.assertEqual(std.count("_", role), 0),
+						
+						project: "${google_project.%s.project_id}" % thisResource,
+						role_id: role,
+						title: role,
+
+					} for role in std.objectFields(body.custom_roles)
+				},
+
 				google_org_policy_policy: {
-					["%s-constraint-%s" % [thisResource, normalize(item.name)]]: {						
+					["%s-constraint-%s" % [thisResource, shortHash(item)]]: {						
 						name: "%s/policies/%s" % [gParent, item.name],
 						parent: gParent,
 
@@ -90,53 +166,55 @@ local org_map(name, anchor, fullbody) =
 							else { },
 
 					} for item in body.constraints
-				} + {
-					["%s-constraint-%s" % [thisResource, normalize(item.name)]]: {						
-						name: "%s/policies/%s" % [gParent, item.name],
-						parent: gParent,
-
-						spec: if (std.objectHas(item, 'spec')) then
-								item.spec
-							else if (std.objectHas(item, 'rules')) then {
-								inherit_from_parent: false,
-								rules: item.rules
-							} else { },
-
-						dry_run_spec: if (std.objectHas(item, 'dry_run_spec')) then
-								item.dry_run_spec
-							else { },
-
-					} for item in std.filter(
-						function (x) (std.objectHas(x, "rules") || std.objectHas(x, "spec") || std.objectHas(x, "dry_run_spec")),
-						body.custom_constraints
-					)
 				},
 
-				google_org_policy_custom_constraint: {
-					["%s-customconstraint-%s" % [thisResource, normalize(item.name)]]: item + {
-						parent: gParent,
-					} for item in body.custom_constraints
-				}
+				// service accounts:
+				[if body.type == "project" then 'google_service_account' else null]: {
+					["%s-sa-%s" % [thisResource, normalize(sa)]]: {
+						project: "${google_project.%s.project_id}" % thisResource,
+						account_id: sa,
+						display_name: body.service_accounts[sa].display_name,
+					} for sa in std.objectFields(body.service_accounts)
+				},
 
-
+				[if body.type == "project" then 'google_service_account_iam_member' else null]: {
+					// impersonation_roles
+					["%s-sa-%s-member-%s" % [thisResource, normalize(sa), shortHash(sa+member+role)]]: {
+						service_account_id: "${google_service_account.%s-sa-%s.name}" % [thisResource, normalize(sa)],
+						role: role,
+						member: member,
+					}
+					for sa in std.objectFields(body.service_accounts)
+					for member in (if std.objectHas(body.service_accounts[sa], 'impersonation_roles') then std.objectFields(body.service_accounts[sa].impersonation_roles) else [])
+					for role in body.service_accounts[sa].impersonation_roles[member]
+				} + {
+					// impersonation_policies
+					["%s-sa-%s-member-%s" % [thisResource, normalize(sa), shortHash(sa+policy)]]: policy + {
+						service_account_id: "${google_service_account.%s-sa-%s.name}" % [thisResource, normalize(sa)]
+					}
+					for sa in std.objectFields(body.service_accounts)
+					for policy in (if std.objectHas(body.service_accounts[sa], 'impersonation_policies') then body.service_accounts[sa].impersonation_policies else [])
+				},
 			}
 		}), if (body.type == "folder" && std.length(body.children) > 0) then 
 			join_objects([
-				recurse("folders/${google_folder.%s.name}" % thisResource, thisResource, item)
+				recurse("folders/${google_folder.%s.folder_id}" % thisResource, thisResource, item)
 				for item in body.children
 			])
 		else { });
 
 	join_objects([
 		recurse(anchor, name, item)
-		for item in fullbody.children
+		for item in [fullbody]
 	]);
 
-local projectAnchor(name, map) = 
-	local resources = org_map(name, if (std.objectHas(map, "parent")) then map.parent else "organizations/12345", map) tailstrict;
+local projectAnchor(name, region, map) = 
+	local resources = org_map(name, region, if (std.objectHas(map, "parent")) then map.parent else "organizations/%s" % projectMetadata.organizationId, map) tailstrict;
 	std.mergePatch({
-		resource: {
-			tlo: true
+		output: {
+			"org-api-activation": {
+				value: auth.enableServices(["orgpolicy.googleapis.com"])
+			}
 		}
 	}, resources);
 
@@ -221,7 +299,15 @@ local projectAnchor(name, map) =
 	 */
 	getRemoteState(project):: std.native("@c6fc/spellcraft-gcp-terraform:getRemoteState")(project),
 
-	googleOrgProject(name, map):: projectAnchor(name, map),
+	/**
+	 * Creates a given folder and project structure, exposing provider aliases
+	 * for later use. See test.jsonnet for reference.
+	 * 
+	 * @param {string} name
+	 * @param {string} region
+	 * @param {object} map
+	 */
+	googleOrgProject(name, region, map):: projectAnchor(name, region, map),
 
 	/**
 	 * Stores the JSON-encoded balue of 'contents' as a file in the GCS backend bucket using
@@ -275,5 +361,4 @@ local projectAnchor(name, map) =
 			region: default
 		}
 	}]
-
 }

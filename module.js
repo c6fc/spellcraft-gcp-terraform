@@ -1,7 +1,5 @@
 'use strict';
 
-process.env.AWS_SDK_JS_SUPPRESS_MAINTENANCE_MODE_MESSAGE=1
-
 const fs = require("fs");
 const os = require("os");
 const crypto = require('crypto');
@@ -11,6 +9,9 @@ const gcpauth = require("@c6fc/spellcraft-gcp-auth");
 const { google } = gcpauth._spellcraft_metadata.functionContext;
 const storage = google.storage('v1');
 const compute = google.compute('v1');
+const resManager = google.cloudresourcemanager('v3');
+
+const { confirm } = require("@inquirer/prompts");
 
 let cachedProject = null;
 
@@ -21,7 +22,8 @@ const remoteStates = {};
 
 exports._spellcraft_metadata = {
 	functionContext: { gcpterraform },
-	init: gcpauth._spellcraft_metadata.init
+	init: gcpauth._spellcraft_metadata.init,
+	requires: ["@c6fc/spellcraft-gcp-auth"]
 }
 
 exports.bootstrap = [async function (project) {
@@ -45,7 +47,7 @@ exports.googleOrgProject = [function (options) {
 }, "options"];
 
 exports.normalizeResourceName = [function (name) {
-	return name.replace(/[^a-zA-Z0-9_-]+/g, "");
+	return name.replace(/[^a-zA-Z0-9_-]+/g, "").toLowerCase();
 }, "name"];
 
 exports.putArtifact = [async function (name, content) {
@@ -58,47 +60,63 @@ exports.shortHash = [function (text) {
 
 async function bootstrap(projectName) {
 	cachedProject = await gcpauth.getProjectId[0]();
+
+	// set env vars to ensure terraform uses the correct project
+	process.env.USER_PROJECT_OVERRIDE ??= "true";
+
 	const targetBucket = `spellcraft-terraform-${cachedProject}`;
-    
-    if (!await getBootstrapBucket()) {
-         try {
-            console.log(`[+] Creating GCS Bootstrap Bucket: ${targetBucket}`);
-            await storage.buckets.insert({
-                project: cachedProject,
-                requestBody: {
-                    name: targetBucket,
-                    location: 'US', // Defaulting to US multi-region for high availability
-                    storageClass: 'STANDARD',
-                    versioning: { enabled: true },
-                    iamConfiguration: {
-                        uniformBucketLevelAccess: { enabled: true }
-                    }
-                }
-            });
-        } catch(e) {
-        	console.log(e);
-            throw new Error(`Failed to discover/create GCS bucket: ${e.message}`);
-        }
-    }
 
-    gcpterraform.bootstrapBucket = targetBucket;
-    gcpterraform.projectName = projectName;
+	if (!await getBootstrapBucket()) {
 
-    // Return the Terraform backend configuration object
-    return {
-        terraform: {
-            backend: {
-                gcs: {
-                    bucket: gcpterraform.bootstrapBucket,
-                    prefix: `spellcraft/${projectName}`
-                }
-            }
-        }
-    };
+		console.log(`No 'spellcraft-terraform' bucket found in project "${cachedProject}".`);
+
+		try {
+			const createIt = await confirm({
+				message: `Create GCS Bootstrap Bucket in project "${cachedProject}"?`,
+				default: true
+			});
+
+			if (!createIt) {
+				console.log("User cancelled bootstrap bucket creation. Select a different project with `export GOOGLE_CLOUD_PROJECT=<project-id>` and re-run the command.");
+				process.exit(0);
+			}
+
+			console.log(`[+] Creating GCS Bootstrap Bucket: ${targetBucket}`);
+			await storage.buckets.insert({
+				project: cachedProject,
+				requestBody: {
+					name: targetBucket,
+					location: 'US', // Defaulting to US multi-region for high availability
+					storageClass: 'STANDARD',
+					versioning: { enabled: true },
+					iamConfiguration: {
+						uniformBucketLevelAccess: { enabled: true }
+					}
+				}
+			});
+		} catch (e) {
+			console.log(e);
+			throw new Error(`Failed to discover/create GCS bucket: ${e.message}`);
+		}
+	}
+
+	gcpterraform.bootstrapBucket = targetBucket;
+	gcpterraform.projectName = projectName;
+
+	// Return the Terraform backend configuration object
+	return {
+		terraform: {
+			backend: {
+				gcs: {
+					bucket: gcpterraform.bootstrapBucket,
+					prefix: `spellcraft/${projectName}`
+				}
+			}
+		}
+	};
 };
 
 async function getBootstrapBucket() {
-
 
 	if (!!gcpterraform.bootstrapBucket) {
 		return gcpterraform.bootstrapBucket;
@@ -108,18 +126,15 @@ async function getBootstrapBucket() {
 		cachedProject = await gcpauth.getProjectId[0]();
 	}
 
-    
-    try {
-        // 1. Try to find existing bucket
-        await storage.buckets.get({ bucket: `spellcraft-terraform-${cachedProject}` });
-        gcpterraform.bootstrapBucket = `spellcraft-terraform-${cachedProject}`;
+	try {
+		await storage.buckets.get({ bucket: `spellcraft-terraform-${cachedProject}` });
+		gcpterraform.bootstrapBucket = `spellcraft-terraform-${cachedProject}`;
 
-        return gcpterraform.bootstrapBucket;
-    } catch (e) {
-    	return false;
-    };
-
-	return false;
+		return gcpterraform.bootstrapBucket;
+	} catch (e) {
+		console.log(`[!] Terraform backend bucket not found in current project: ${cachedProject}`);
+		return false
+	}
 }
 
 async function getRemoteState(project) {
@@ -127,18 +142,19 @@ async function getRemoteState(project) {
 	if (!!!remoteStates[project]) {
 		if (!gcpterraform.bootstrapBucket) throw new Error("Module not bootstrapped. Call bootstrap() first.");
 
-		try {
-	        const res = await storage.objects.get({
-	            bucket: gcpterraform.bootstrapBucket,
-	            object: `spellcraft/${project}/default.tfstate`,
-	            alt: 'media'
-	        });
-	        return res.data;
-	    } catch (e) {
-	        throw new Error(`Could not find remote state for project: ${project}`);
-	    }
+		let res;
 
-		const state = JSON.parse(stateJson.Body);
+		try {
+			res = await storage.objects.get({
+				bucket: gcpterraform.bootstrapBucket,
+				object: `spellcraft/${project}/default.tfstate`,
+				alt: 'media'
+			});
+		} catch (e) {
+			throw new Error(`Could not find remote state for project: ${project}`);
+		}
+
+		const state = JSON.parse(res.data);
 
 		const resources = state.resources.reduce((a, c) => {
 			let path;
@@ -174,31 +190,31 @@ async function getRemoteState(project) {
 }
 
 async function getArtifact(name) {
-    if (!gcpterraform.bootstrapBucket) throw new Error("Module not bootstrapped. Call bootstrap() first.");
+	if (!gcpterraform.bootstrapBucket) throw new Error("Module not bootstrapped. Call bootstrap() first.");
 
-    try {
-        const res = await storage.objects.get({
-            bucket: gcpterraform.bootstrapBucket,
-            object: `spellcraft/${gcpterraform.projectName}/artifacts/${name}.json`,
-            alt: 'media'
-        });
-        return res.data;
-    } catch (e) {
-        return null;
-    }
+	try {
+		const res = await storage.objects.get({
+			bucket: gcpterraform.bootstrapBucket,
+			object: `spellcraft/${gcpterraform.projectName}/artifacts/${name}.json`,
+			alt: 'media'
+		});
+		return res.data;
+	} catch (e) {
+		return null;
+	}
 };
 
 async function putArtifact(name, content) {
-    if (!gcpterraform.bootstrapBucket) throw new Error("Module not bootstrapped. Call bootstrap() first.");
+	if (!gcpterraform.bootstrapBucket) throw new Error("Module not bootstrapped. Call bootstrap() first.");
 
-    const res = await storage.objects.insert({
-        bucket: gcpterraform.bootstrapBucket,
-        name: `spellcraft/${gcpterraform.projectName}/artifacts/${name}.json`,
-        media: {
-            mimeType: 'application/json',
-            body: JSON.stringify(content, null, 2)
-        }
-    });
+	const res = await storage.objects.insert({
+		bucket: gcpterraform.bootstrapBucket,
+		name: `spellcraft/${gcpterraform.projectName}/artifacts/${name}.json`,
+		media: {
+			mimeType: 'application/json',
+			body: JSON.stringify(content, null, 2)
+		}
+	});
 
-    return !!res.data;
+	return !!res.data;
 };

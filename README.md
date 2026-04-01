@@ -1,9 +1,9 @@
-# SpellCraft AWS Integration
+# SpellCraft GCP Integration
 
 [![NPM version](https://img.shields.io/npm/v/@c6fc/spellcraft-gcp-terraform.svg?style=flat)](https://www.npmjs.com/package/@c6fc/spellcraft-gcp-terraform)
 [![License](https://img.shields.io/npm/l/@c6fc/spellcraft-gcp-terraform.svg?style=flat)](https://opensource.org/licenses/MIT)
 
-This module exposes common constructs for using [SpellCraft](https://github.com/@c6fc/spellcraft) SpellFrames to deploy infrastructure to AWS using Terraform.
+This module exposes common constructs for using [SpellCraft](https://github.com/@c6fc/spellcraft) SpellFrames to deploy infrastructure to GCP using Terraform.
 
 ```sh
 npm install --save @c6fc/spellcraft-gcp-terraform
@@ -19,17 +19,23 @@ This module exposes the concept of a bootstrap bucket (functionally a terraform 
 
 ## SpellFrame 'init()' features
 
-This plugin does not perform any distinct 'init' operations, other than to initialize credentials within the dependant plugin `@c6fc/terraform-gcp-auth`.
+This plugin does not perform any distinct 'init' operations, other than to initialize credentials within the dependant plugin `@c6fc/spellcraft-gcp-auth`.
+
+```jsonnet
+local gcp = import "@c6fc/spellcraft-gcp-terraform";
+
+# An instance of @c6fc/spellcraft-gcp-auth
+gcp.auth;
+```
 
 ## JavaScript context features
 
-Extends the JavaScript function context with an `awsterraform` object containing the following keys:
+Extends the JavaScript function context with an `gcpterraform` object containing the following keys:
 
 ```JSON
 { 
 	"projectName": "<contains the name of the project specified by bootstrap()>",
-	"bootstrapBucket": "<contains the ARN for the bootstrap bucket>",
-	"bootstrapLocation": "<contains the region where the bootstrap bucket is located>"
+	"bootstrapBucket": "<contains the name for the bootstrap bucket>",
 }
 ```
 
