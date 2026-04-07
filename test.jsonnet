@@ -29,12 +29,12 @@ local directoryId = gcp.auth.getProjectMetadata().directoryId;
 			*/
 		}
 	},
-	"projectAnchor.tf.json": gcp.googleOrgProject("test", "us-west2", {
+	"projectStructure.tf.json": gcp.googleOrgProject("test", "us-west2", {
 		type: "folder",
-		name: "orgfoldertest",
+		name: "folder1",
 		children: [{
 			type: "folder",
-			name: "orgfoldertest2",
+			name: "folder2",
 
 			iam_members: [{
 				role: "roles/resourcemanager.folderAdmin",
@@ -50,7 +50,7 @@ local directoryId = gcp.auth.getProjectMetadata().directoryId;
 
 			children: [{
 				type: "project",
-				name: "orgprojecttest",
+				name: "project1",
 				provider_regions: ["us-central1"],
 
 				audit_config: {

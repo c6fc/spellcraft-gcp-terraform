@@ -26,7 +26,7 @@ local org_map(name, region, anchor, fullbody) =
 			service_accounts:: {},
 			audit_config:: {},
 			constraints:: [],
-			custom_roles:: [],
+			custom_roles:: {},
 			children:: [],
 			provider_regions:: []
 		} + rawbody + {
@@ -50,19 +50,19 @@ local org_map(name, region, anchor, fullbody) =
 		std.mergePatch(std.prune({
 			provider: (if body.type == "project" then [{
 				google: {
-					project: "${google_project.%s.project_id}" % thisResource,
-					alias: body.name,
+					project: "${terraform_data.%s-service-depends.output}" % thisResource,
+					alias: "%s" % [body.name],
 					region: region
 				}
 			}, {
 				google: {
-					project: "${google_project.%s.project_id}" % thisResource,
+					project: "${terraform_data.%s-service-depends.output}" % thisResource,
 					alias: "%s-%s" % [body.name, region],
 					region: region
 				}
 			}] + [{
 				google: {
-					project: "${google_project.%s.project_id}" % thisResource,
+					project: "${terraform_data.%s-service-depends.output}" % thisResource,
 					alias: "%s-%s" % [body.name, r],
 					region: r
 				}
@@ -73,7 +73,7 @@ local org_map(name, region, anchor, fullbody) =
 						deletion_policy: "DELETE",
 						billing_account: projectMetadata.billingAccount,
 					} + body + {
-						project_id: "%s-%s" % [normalize(body.name), shortHash(body + parent)],
+						project_id: "%s-%s-${random_bytes.%s-org-random-suffix.hex}" % [normalize(body.name), shortHash(body + parent), name],
 
 						[if std.startsWith(parent, "organizations/") then 'org_id' else null]: std.split(parent, "/")[1],
 						[if std.startsWith(parent, "folders/") then 'folder_id' else null]: std.split(parent, "/")[1],
@@ -84,7 +84,7 @@ local org_map(name, region, anchor, fullbody) =
 					[thisResource]: {
 						name:: "",
 					} + body + {
-						display_name: body.name,
+						display_name: "%s" % [body.name],
 						parent: parent,
 						deletion_protection: false
 					}
@@ -95,8 +95,18 @@ local org_map(name, region, anchor, fullbody) =
 						project: "${google_project.%s.project_id}" % thisResource,
 						service: service,
 						disable_on_destroy: false,
-						disable_dependent_services: false
+						disable_dependent_services: false,
 					} for service in body.services
+				},
+
+				[if body.type == "project" then 'terraform_data' else null]: {
+					["%s-service-depends" % [thisResource]]: {
+						input: "${google_project.%s.project_id}" % thisResource,
+						depends_on: ["google_project_service.%s-services-%s" % [thisResource, std.split(service, ".")[0]] for service in body.services]
+					},
+					["%s-oob-service-depends" % [thisResource]]: {
+						input: if (std.length(body.services) > 0) then auth.enableServices(body.services) else true
+					}
 				},
 
 				[if body.type == "project" then 'google_project_iam_member' else 'google_folder_iam_member']: {
@@ -211,6 +221,13 @@ local org_map(name, region, anchor, fullbody) =
 local projectAnchor(name, region, map) = 
 	local resources = org_map(name, region, if (std.objectHas(map, "parent")) then map.parent else "organizations/%s" % projectMetadata.organizationId, map) tailstrict;
 	std.mergePatch({
+		resource: {
+			random_bytes: {
+				["%s-org-random-suffix" % name]: {
+					length: 2
+				}
+			}
+		},
 		output: {
 			"org-api-activation": {
 				value: auth.enableServices(["orgpolicy.googleapis.com"])
@@ -337,7 +354,7 @@ local projectAnchor(name, region, map) =
 	 * @example
 	 * local gcp = import "@c6fc/spellcraft-gcp-terraform";
 	 *
-	 * gcp.providerAliases("us-west2");
+	 * gcp.providerAliases("us-west2", {},  "us-");
 	 *
 	 * // Returns:
 	 * [{ google: {

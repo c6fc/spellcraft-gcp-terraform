@@ -63,6 +63,7 @@ async function bootstrap(projectName) {
 
 	// set env vars to ensure terraform uses the correct project
 	process.env.USER_PROJECT_OVERRIDE ??= "true";
+	process.env.GOOGLE_CLOUD_QUOTA_PROJECT ??= cachedProject;
 
 	const targetBucket = `spellcraft-terraform-${cachedProject}`;
 
