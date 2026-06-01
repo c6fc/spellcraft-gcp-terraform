@@ -19,7 +19,9 @@ This module exposes the concept of a bootstrap bucket (functionally a terraform 
 
 ## SpellFrame 'init()' features
 
-This plugin does not perform any distinct 'init' operations, other than to initialize credentials within the dependant plugin `@c6fc/spellcraft-gcp-auth`.
+This plugin registers a custom hook during `init()` on the `SpellFrame` instance. It listens to namespaced events from `@c6fc/spellcraft-terraform`:
+
+- **Deferred Service Enablement Registry**: When GCP services are declared in Jsonnet via `enableServices()`, they are not enabled immediately during manifestation. Instead, they are collected in an in-memory registry. When the `@c6fc/spellcraft-terraform:pre-apply` event is fired (right before Terraform runs), all accumulated services are enabled in a single batched GCP API invocation, preventing API latency from slowing down local rendering iterations.
 
 ```jsonnet
 local gcp = import "@c6fc/spellcraft-gcp-terraform";
@@ -42,6 +44,22 @@ Extends the JavaScript function context with an `gcpterraform` object containing
 <!-- SPELLCRAFT_DOCS_API_START -->
 ## API Reference
 
+### `enableServices(services)`
+
+Registers a list of GCP services/APIs to be enabled. Rather than enabling them immediately (which slows down rendering), this function registers them in an in-memory registry, which is subsequently activated in a single batched call when the `@c6fc/spellcraft-terraform:pre-apply` event triggers.
+
+- param {array} services - Array of service names to enable (e.g. `["orgpolicy.googleapis.com"]`).
+- returns {boolean} true
+
+**Examples:**
+
+```jsonnet
+local gcp = import "@c6fc/spellcraft-gcp-terraform";
+
+gcp.enableServices(["orgpolicy.googleapis.com"]);
+```
+
+---
 ### `bootstrap(project)`
 
 Creates a Terraform backend bucket if one doesn't already exist, then
@@ -149,6 +167,24 @@ gcp.putArtifact("myArtifact", { someData: someValue });
 // Returns:
 true
 ```
+
+---
+### `googleOrgProject(name, region, map)`
+
+Creates a given folder and project hierarchy in GCP and returns the set of Terraform resources (folders, projects, IAM policies, service accounts, custom roles, etc.).
+
+- param {string} name - The anchor name for the organization hierarchy.
+- param {string} region - The default region.
+- param {object} map - The tree structure defining folders and projects (see `test.jsonnet` for full schema/example).
+
+#### Dependency & Ordering Features:
+- **Service Enablement Ordering:** Resources created within a project (e.g., service accounts, custom roles, IAM policies) automatically receive a `depends_on` targeting that project's service activation resources (`terraform_data.<project-name>-service-depends`). This guarantees they wait until the project's APIs/services are enabled.
+- **Post-Everything Dependency:** An automatic `terraform_data.<name>-org-complete` resource is generated. It has a `depends_on` array containing every resource created in the module hierarchy. You can use this to create manual dependencies in your own files:
+  ```jsonnet
+  my_resource: {
+      depends_on: ["terraform_data.test-org-complete"]
+  }
+  ```
 
 ---
 ### `providerAliases(default, filter="")`

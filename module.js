@@ -19,12 +19,30 @@ let cachedProject = null;
 const artifacts = {};
 const gcpterraform = { projectName: null, bootstrapBucket: null };
 const remoteStates = {};
+const serviceRegistry = new Set();
 
 exports._spellcraft_metadata = {
 	functionContext: { gcpterraform },
-	init: gcpauth._spellcraft_metadata.init,
+	init: async (spellframe) => {
+		await gcpauth._spellcraft_metadata.init(spellframe);
+
+		spellframe.on('@c6fc/spellcraft-terraform:pre-apply', async () => {
+			if (serviceRegistry.size > 0) {
+				const servicesArray = Array.from(serviceRegistry);
+				console.log(`[spellcraft-gcp-terraform] Enabling registered GCP services on pre-apply: ${servicesArray.join(', ')}`);
+				await gcpauth.enableServices[0](JSON.stringify(servicesArray));
+				serviceRegistry.clear();
+			}
+		});
+	},
 	requires: ["@c6fc/spellcraft-gcp-auth"]
 }
+
+exports.enableServices = [function (servicesJson) {
+	const services = JSON.parse(servicesJson);
+	services.forEach(s => serviceRegistry.add(s));
+	return true;
+}, "services"];
 
 exports.bootstrap = [async function (project) {
 	return await bootstrap(project);

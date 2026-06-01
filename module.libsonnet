@@ -7,6 +7,7 @@ local projectMetadata = auth.getProjectMetadata();
 
 local normalize(name) = std.native("@c6fc/spellcraft-gcp-terraform:normalizeResourceName")(name);
 local shortHash(name) = std.native("@c6fc/spellcraft-gcp-terraform:shortHash")(std.manifestJsonEx(name, ''));
+local enableServices(services) = std.native("@c6fc/spellcraft-gcp-terraform:enableServices")(std.manifestJsonEx(services, ""));
 
 local join_objects(objs) = 
 	local aux(arr, i, running) =
@@ -105,7 +106,7 @@ local org_map(name, region, anchor, fullbody) =
 						depends_on: ["google_project_service.%s-services-%s" % [thisResource, std.split(service, ".")[0]] for service in body.services]
 					},
 					["%s-oob-service-depends" % [thisResource]]: {
-						input: if (std.length(body.services) > 0) then auth.enableServices(body.services) else true
+						input: if (std.length(body.services) > 0) then enableServices(body.services) else true
 					}
 				},
 
@@ -116,7 +117,8 @@ local org_map(name, region, anchor, fullbody) =
 						[if body.type == "folder" then 'folder' else null]: "${google_folder.%s.name}" % thisResource,
 						
 						role: item.role,
-						member: member
+						member: member,
+						[if body.type == "project" then 'depends_on']: ["terraform_data.%s-service-depends" % thisResource],
 					} for item in body.iam_members for member in item.members
 				} + {
 					["%s-sa-permissions-%s-%s" % [thisResource, normalize(sa), shortHash(sa+entry)]]: (if std.type(entry) == "string" then {
@@ -125,6 +127,7 @@ local org_map(name, region, anchor, fullbody) =
 						role: (if std.startsWith(super.role, "custom/") then "projects/${google_project.%s.project_id}/roles/%s" % [thisResource, std.split(super.role, "/")[1]] else super.role),
 						project: "${google_project.%s.project_id}" % thisResource,
 						member: "serviceAccount:${google_service_account.%s-sa-%s.email}" % [thisResource, normalize(sa)],
+						depends_on: ["terraform_data.%s-service-depends" % thisResource],
 					}
 					for sa in std.objectFields(body.service_accounts)
 					for entry in (if std.objectHas(body.service_accounts[sa], 'identity_policies') then body.service_accounts[sa].identity_policies else [])
@@ -142,7 +145,8 @@ local org_map(name, region, anchor, fullbody) =
 								log_type: e
 							} else e),
 							body.audit_config[k].log_types
-						)
+						),
+						[if body.type == "project" then 'depends_on']: ["terraform_data.%s-service-depends" % thisResource],
 					} for k in std.objectFields(body.audit_config)
 				},
 
@@ -155,7 +159,7 @@ local org_map(name, region, anchor, fullbody) =
 						project: "${google_project.%s.project_id}" % thisResource,
 						role_id: role,
 						title: role,
-
+						depends_on: ["terraform_data.%s-service-depends" % thisResource],
 					} for role in std.objectFields(body.custom_roles)
 				},
 
@@ -174,7 +178,7 @@ local org_map(name, region, anchor, fullbody) =
 						dry_run_spec: if (std.objectHas(item, 'dry_run_spec')) then
 								item.dry_run_spec
 							else { },
-
+						[if body.type == "project" then 'depends_on']: ["terraform_data.%s-service-depends" % thisResource],
 					} for item in body.constraints
 				},
 
@@ -184,6 +188,7 @@ local org_map(name, region, anchor, fullbody) =
 						project: "${google_project.%s.project_id}" % thisResource,
 						account_id: sa,
 						display_name: body.service_accounts[sa].display_name,
+						depends_on: ["terraform_data.%s-service-depends" % thisResource],
 					} for sa in std.objectFields(body.service_accounts)
 				},
 
@@ -193,6 +198,7 @@ local org_map(name, region, anchor, fullbody) =
 						service_account_id: "${google_service_account.%s-sa-%s.name}" % [thisResource, normalize(sa)],
 						role: role,
 						member: member,
+						depends_on: ["terraform_data.%s-service-depends" % thisResource],
 					}
 					for sa in std.objectFields(body.service_accounts)
 					for member in (if std.objectHas(body.service_accounts[sa], 'impersonation_roles') then std.objectFields(body.service_accounts[sa].impersonation_roles) else [])
@@ -200,7 +206,8 @@ local org_map(name, region, anchor, fullbody) =
 				} + {
 					// impersonation_policies
 					["%s-sa-%s-member-%s" % [thisResource, normalize(sa), shortHash(sa+policy)]]: policy + {
-						service_account_id: "${google_service_account.%s-sa-%s.name}" % [thisResource, normalize(sa)]
+						service_account_id: "${google_service_account.%s-sa-%s.name}" % [thisResource, normalize(sa)],
+						depends_on: ["terraform_data.%s-service-depends" % thisResource],
 					}
 					for sa in std.objectFields(body.service_accounts)
 					for policy in (if std.objectHas(body.service_accounts[sa], 'impersonation_policies') then body.service_accounts[sa].impersonation_policies else [])
@@ -220,7 +227,7 @@ local org_map(name, region, anchor, fullbody) =
 
 local projectAnchor(name, region, map) = 
 	local resources = org_map(name, region, if (std.objectHas(map, "parent")) then map.parent else "organizations/%s" % projectMetadata.organizationId, map) tailstrict;
-	std.mergePatch({
+	local all_resources = std.mergePatch({
 		resource: {
 			random_bytes: {
 				["%s-org-random-suffix" % name]: {
@@ -230,10 +237,28 @@ local projectAnchor(name, region, map) =
 		},
 		output: {
 			"org-api-activation": {
-				value: auth.enableServices(["orgpolicy.googleapis.com"])
+				value: enableServices(["orgpolicy.googleapis.com"])
 			}
 		}
 	}, resources);
+	local complete_resource_name = "%s-org-complete" % name;
+	local all_deps = [
+		"%s.%s" % [res_type, res_name]
+		for res_type in std.objectFields(all_resources.resource)
+		for res_name in std.objectFields(all_resources.resource[res_type])
+		if !(res_type == "terraform_data" && res_name == complete_resource_name)
+	];
+	std.mergePatch(all_resources, {
+		resource: {
+			terraform_data: {
+				[complete_resource_name]: {
+					input: name,
+					depends_on: all_deps
+				}
+			}
+		}
+	});
+
 
 {
 	// JS Native functions are already documented in spellcraft_modules/foo.js
