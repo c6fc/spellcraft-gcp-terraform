@@ -205,7 +205,9 @@ async function getRemoteState(project) {
 		remoteStates[project] = resources;
 	}
 
-	return resources;
+	// Read back through the cache. `resources` is block-scoped to the branch
+	// above, so returning it directly threw a ReferenceError on every call.
+	return remoteStates[project];
 }
 
 async function getArtifact(name) {
