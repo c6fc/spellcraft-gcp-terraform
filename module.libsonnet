@@ -1,405 +1,177 @@
-// Don't try to 'import' your spellcraft native functions here.
-// Use std.native(function)(..args) instead
+// The Jsonnet face of this plugin. Native functions from module.js are reached
+// through std.native(), namespaced by package name; everything else here is
+// ordinary Jsonnet built on top of them.
+//
+// Doc comments below are lifted into README.md by `npx spellcraft doc`.
 
-local auth = import "@c6fc/spellcraft-gcp-auth/module.libsonnet";
-
-local projectMetadata = auth.getProjectMetadata();
-
-local normalize(name) = std.native("@c6fc/spellcraft-gcp-terraform:normalizeResourceName")(name);
-local shortHash(name) = std.native("@c6fc/spellcraft-gcp-terraform:shortHash")(std.manifestJsonEx(name, ''));
-local enableServices(services) = std.native("@c6fc/spellcraft-gcp-terraform:enableServices")(std.manifestJsonEx(services, ""));
-
-local join_objects(objs) = 
-	local aux(arr, i, running) =
-		if i >= std.length(arr) then
-			running
-		else
-			aux(arr, i + 1, std.mergePatch(running, arr[i])) tailstrict;
-	aux(objs, 0, {});
-
-local org_map(name, region, anchor, fullbody) =
-	local recurse(parent, resource, rawbody) = 
-		// Pre-define and hide interpreted values to avoid lots of conditionals.
-		local body = {
-			type:: "",
-			iam_members:: [],
-			services:: [],
-			service_accounts:: {},
-			audit_config:: {},
-			constraints:: [],
-			custom_roles:: {},
-			children:: [],
-			provider_regions:: []
-		} + rawbody + {
-			services:: std.filter(function(x) x != "", std.uniq(std.sort(super.services + [
-				if std.objectHas(rawbody, "iam_members") then "iam.googleapis.com" else "",
-				if std.objectHas(rawbody, "service_accounts") then "iam.googleapis.com" else "",
-				if std.objectHas(rawbody, "audit_config") then "iam.googleapis.com" else "",
-				if std.objectHas(rawbody, "constraints") then "orgpolicy.googleapis.com" else "",
-				if std.objectHas(rawbody, "custom_constraints") then "orgpolicy.googleapis.com" else "",
-				if std.objectHas(rawbody, "custom_roles") then "iam.googleapis.com" else "",
-			])))
-		};
-
-		local thisResource = normalize("%s_%s" % [resource, body.name]);
-
-		local gParent = if (body.type == "project") then
-				"projects/${google_project.%s.project_id}" % thisResource
-			else
-				"folders/${google_folder.%s.folder_id}" % thisResource;
-
-		std.mergePatch(std.prune({
-			provider: (if body.type == "project" then [{
-				google: {
-					project: "${terraform_data.%s-service-depends.output}" % thisResource,
-					alias: "%s" % [body.name],
-					region: region
-				}
-			}, {
-				google: {
-					project: "${terraform_data.%s-service-depends.output}" % thisResource,
-					alias: "%s-%s" % [body.name, region],
-					region: region
-				}
-			}] + [{
-				google: {
-					project: "${terraform_data.%s-service-depends.output}" % thisResource,
-					alias: "%s-%s" % [body.name, r],
-					region: r
-				}
-			} for r in body.provider_regions] else []),
-			resource: {
-				[if body.type == "project" then 'google_project' else null]: {
-					[thisResource]: {
-						deletion_policy: "DELETE",
-						billing_account: projectMetadata.billingAccount,
-					} + body + {
-						project_id: "%s-%s-${random_bytes.%s-org-random-suffix.hex}" % [normalize(body.name), shortHash(body + parent), name],
-
-						[if std.startsWith(parent, "organizations/") then 'org_id' else null]: std.split(parent, "/")[1],
-						[if std.startsWith(parent, "folders/") then 'folder_id' else null]: std.split(parent, "/")[1],
-					}
-				},
-
-				[if body.type == "folder" then 'google_folder' else null]: {
-					[thisResource]: {
-						name:: "",
-					} + body + {
-						display_name: "%s" % [body.name],
-						parent: parent,
-						deletion_protection: false
-					}
-				},
-
-				[if body.type == "project" then 'google_project_service' else null]: {
-					["%s-services-%s" % [thisResource, std.split(service, ".")[0]]]: {
-						project: "${google_project.%s.project_id}" % thisResource,
-						service: service,
-						disable_on_destroy: false,
-						disable_dependent_services: false,
-					} for service in body.services
-				},
-
-				[if body.type == "project" then 'terraform_data' else null]: {
-					["%s-service-depends" % [thisResource]]: {
-						input: "${google_project.%s.project_id}" % thisResource,
-						depends_on: ["google_project_service.%s-services-%s" % [thisResource, std.split(service, ".")[0]] for service in body.services]
-					},
-					["%s-oob-service-depends" % [thisResource]]: {
-						input: if (std.length(body.services) > 0) then enableServices(body.services) else true
-					}
-				},
-
-				[if body.type == "project" then 'google_project_iam_member' else 'google_folder_iam_member']: {
-					["%s-member-%s" % [thisResource, shortHash(item + member)]]: {
-						
-						[if body.type == "project" then 'project' else null]: "${google_project.%s.project_id}" % thisResource,
-						[if body.type == "folder" then 'folder' else null]: "${google_folder.%s.name}" % thisResource,
-						
-						role: item.role,
-						member: member,
-						[if body.type == "project" then 'depends_on']: ["terraform_data.%s-service-depends" % thisResource],
-					} for item in body.iam_members for member in item.members
-				} + {
-					["%s-sa-permissions-%s-%s" % [thisResource, normalize(sa), shortHash(sa+entry)]]: (if std.type(entry) == "string" then {
-						role: entry
-					} else entry) + {
-						role: (if std.startsWith(super.role, "custom/") then "projects/${google_project.%s.project_id}/roles/%s" % [thisResource, std.split(super.role, "/")[1]] else super.role),
-						project: "${google_project.%s.project_id}" % thisResource,
-						member: "serviceAccount:${google_service_account.%s-sa-%s.email}" % [thisResource, normalize(sa)],
-						depends_on: ["terraform_data.%s-service-depends" % thisResource],
-					}
-					for sa in std.objectFields(body.service_accounts)
-					for entry in (if std.objectHas(body.service_accounts[sa], 'identity_policies') then body.service_accounts[sa].identity_policies else [])
-				},
-
-				[if body.type == "project" then 'google_project_iam_audit_config' else 'google_folder_iam_audit_config']: {
-					["%s-audit-%s" % [thisResource, normalize(std.split(k, ".")[0])]]: {
-						
-						[if body.type == "project" then 'project' else null]: "${google_project.%s.project_id}" % thisResource,
-						[if body.type == "folder" then 'folder' else null]: "${google_folder.%s.name}" % thisResource,
-						
-						service: k,
-						audit_log_config: std.map(
-							function(e) (if std.type(e) == "string" then {
-								log_type: e
-							} else e),
-							body.audit_config[k].log_types
-						),
-						[if body.type == "project" then 'depends_on']: ["terraform_data.%s-service-depends" % thisResource],
-					} for k in std.objectFields(body.audit_config)
-				},
-
-				[if body.type == "project" then 'google_project_iam_custom_role' else null]: {
-					["%s-customrole-%s" % [thisResource, role]]: body.custom_roles[role] + {
-						
-						// Fail if the name contains underscores. I agree this is a dumb limitation
-						local failWithUnderscores = std.assertEqual(std.count("_", role), 0),
-						
-						project: "${google_project.%s.project_id}" % thisResource,
-						role_id: role,
-						title: role,
-						depends_on: ["terraform_data.%s-service-depends" % thisResource],
-					} for role in std.objectFields(body.custom_roles)
-				},
-
-				google_org_policy_policy: {
-					["%s-constraint-%s" % [thisResource, shortHash(item)]]: {						
-						name: "%s/policies/%s" % [gParent, item.name],
-						parent: gParent,
-
-						spec: if (std.objectHas(item, 'spec')) then
-								item.spec
-							else if (std.objectHas(item, 'rules')) then {
-								inherit_from_parent: false,
-								rules: item.rules
-							} else { },
-
-						dry_run_spec: if (std.objectHas(item, 'dry_run_spec')) then
-								item.dry_run_spec
-							else { },
-						[if body.type == "project" then 'depends_on']: ["terraform_data.%s-service-depends" % thisResource],
-					} for item in body.constraints
-				},
-
-				// service accounts:
-				[if body.type == "project" then 'google_service_account' else null]: {
-					["%s-sa-%s" % [thisResource, normalize(sa)]]: {
-						project: "${google_project.%s.project_id}" % thisResource,
-						account_id: sa,
-						display_name: body.service_accounts[sa].display_name,
-						depends_on: ["terraform_data.%s-service-depends" % thisResource],
-					} for sa in std.objectFields(body.service_accounts)
-				},
-
-				[if body.type == "project" then 'google_service_account_iam_member' else null]: {
-					// impersonation_roles
-					["%s-sa-%s-member-%s" % [thisResource, normalize(sa), shortHash(sa+member+role)]]: {
-						service_account_id: "${google_service_account.%s-sa-%s.name}" % [thisResource, normalize(sa)],
-						role: role,
-						member: member,
-						depends_on: ["terraform_data.%s-service-depends" % thisResource],
-					}
-					for sa in std.objectFields(body.service_accounts)
-					for member in (if std.objectHas(body.service_accounts[sa], 'impersonation_roles') then std.objectFields(body.service_accounts[sa].impersonation_roles) else [])
-					for role in body.service_accounts[sa].impersonation_roles[member]
-				} + {
-					// impersonation_policies
-					["%s-sa-%s-member-%s" % [thisResource, normalize(sa), shortHash(sa+policy)]]: policy + {
-						service_account_id: "${google_service_account.%s-sa-%s.name}" % [thisResource, normalize(sa)],
-						depends_on: ["terraform_data.%s-service-depends" % thisResource],
-					}
-					for sa in std.objectFields(body.service_accounts)
-					for policy in (if std.objectHas(body.service_accounts[sa], 'impersonation_policies') then body.service_accounts[sa].impersonation_policies else [])
-				},
-			}
-		}), if (body.type == "folder" && std.length(body.children) > 0) then 
-			join_objects([
-				recurse("folders/${google_folder.%s.folder_id}" % thisResource, thisResource, item)
-				for item in body.children
-			])
-		else { });
-
-	join_objects([
-		recurse(anchor, name, item)
-		for item in [fullbody]
-	]);
-
-local projectAnchor(name, region, map) = 
-	local resources = org_map(name, region, if (std.objectHas(map, "parent")) then map.parent else "organizations/%s" % projectMetadata.organizationId, map) tailstrict;
-	local all_resources = std.mergePatch({
-		resource: {
-			random_bytes: {
-				["%s-org-random-suffix" % name]: {
-					length: 2
-				}
-			}
-		},
-		output: {
-			"org-api-activation": {
-				value: enableServices(["orgpolicy.googleapis.com"])
-			}
-		}
-	}, resources);
-	local complete_resource_name = "%s-org-complete" % name;
-	local all_deps = [
-		"%s.%s" % [res_type, res_name]
-		for res_type in std.objectFields(all_resources.resource)
-		for res_name in std.objectFields(all_resources.resource[res_type])
-		if !(res_type == "terraform_data" && res_name == complete_resource_name)
-	];
-	std.mergePatch(all_resources, {
-		resource: {
-			terraform_data: {
-				[complete_resource_name]: {
-					input: name,
-					depends_on: all_deps
-				}
-			}
-		}
-	});
-
+local auth = import "@c6fc/spellcraft-aws-auth/module.libsonnet";
 
 {
-	// JS Native functions are already documented in spellcraft_modules/foo.js
-	// but need to be specified here to expose them through the import
-
-	/**
-	 * Direct passthrough of the @c6fc/spellcraft-gcp-auth
-	 */
+	// Passthrough of @c6fc/spellcraft-aws-auth, so a spell that imports this
+	// module can reach `aws.auth.getCallerIdentity()` without a second import.
 	auth: auth,
 
 	/**
-	 * Creates a Terraform backend bucket if one doesn't already exist, then
-	 * returns a 'backend' object referencing this bucket and a unique path
-	 * for this project's state and artifacts.
+	 * Prepares the S3 backend for a project, creating the bootstrap bucket if it
+	 * does not exist yet, and returns the Terraform `backend` block for it.
 	 *
-	 * @param {string} project
-	 * @returns {object} backend
+	 * This is the one function here that writes: it creates the bucket on first
+	 * use. State and artifacts for every project live in that one bucket, keyed
+	 * by project name.
+	 *
+	 * `getArtifact()` and `putArtifact()` key their object off the project name
+	 * this sets, so either one throws if it runs before this has. Jsonnet does
+	 * not guarantee that order on its own -- thread this function's result into
+	 * whatever calls them, the way `enableServices()` is threaded elsewhere in
+	 * this ecosystem, rather than merely calling both in the same manifest.
+	 *
+	 * A spell that only ever bootstraps one project, known ahead of time, can
+	 * skip calling this from Jsonnet at all: set `config.spellcraftProject` in
+	 * `package.json` and it runs during `init()`, before evaluation starts, so
+	 * there's no ordering hazard to think about. The two are mutually
+	 * exclusive -- calling this explicitly throws if `config.spellcraftProject`
+	 * already bootstrapped the spell, rather than letting the two silently
+	 * disagree about which project is live.
+	 *
+	 * A spell has one project. Calling this again with a *different* name in
+	 * the same process throws for the same reason -- to read another spell's
+	 * state, use `getRemoteState()`, not a second `bootstrap()` call. The
+	 * same name twice is a no-op.
+	 *
+	 * @param {string} project - names the state prefix; use one per spell
+	 * @returns {object} a Terraform block ready to merge into a `.tf.json` file
 	 * @example
-	 * local gcp = import "@c6fc/spellcraft-gcp-terraform";
+	 * local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 	 *
-	 * gcp.bootstrap("myBootstrapTest");
+	 * { "backend.tf.json": aws.bootstrap("my-project") }
 	 *
 	 * // Returns:
-	 * {
-	 *    "terraform": {
-	 *        "backend": {
-	 *            "gcs": {
-	 *                "bucket": "spellcraft-random-0123456789",
-	 *                "key": "spellcraft/myBootstrapTest/terraform.tfstate",
-	 *            }
-	 *        }
-	 *    }
-	 * }
+	 * // {
+	 * //   "terraform": {
+	 * //     "backend": {
+	 * //       "s3": {
+	 * //         "bucket": "spellcraft-random-0123456789",
+	 * //         "key": "spellcraft/my-project/terraform.tfstate",
+	 * //         "region": "us-east-1"
+	 * //       }
+	 * //     }
+	 * //   }
+	 * // }
 	 */
-	bootstrap(project):: std.native("@c6fc/spellcraft-gcp-terraform:bootstrap")(project),
+	bootstrap(project):: std.native("@c6fc/spellcraft-aws-terraform:bootstrap")(project),
 
 	/**
-	 * Obtains the contents of a named artifact stored alongside this project in the bootstrap
-	 * bucket. This artifact is created with 'putArtifact';
+	 * Reads an artifact previously stored by `putArtifact()`.
 	 *
-	 * @param {string} name
-	 * @returns {object} backend
+	 * Artifacts are how one spell hands a value to another without a Terraform
+	 * data source — the value is fetched while the manifest evaluates, so it can
+	 * shape the configuration rather than only appear in it.
+	 *
+	 * Throws if `bootstrap()` hasn't set a project name yet -- see `bootstrap()`
+	 * for why that ordering isn't automatic.
+	 *
+	 * @param {string} name - the artifact name given to `putArtifact()`
+	 * @returns {*} the stored value, parsed back from JSON
 	 * @example
-	 * local gcp = import "@c6fc/spellcraft-gcp-terraform";
+	 * local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 	 *
-	 * gcp.getArtifact("myArtifact");
+	 * local backend = aws.bootstrap("my-project");
+	 * local shared = if backend != null then aws.getArtifact("network") else null;
 	 *
-	 * // Returns:
-	 * <contents of your artifact>
+	 * { "app.tf.json": { resource: { aws_instance: { app: { subnet_id: shared.subnetId } } } } }
 	 */
-	getArtifact(name):: std.native("@c6fc/spellcraft-gcp-terraform:getArtifact")(name),
+	getArtifact(name):: std.native("@c6fc/spellcraft-aws-terraform:getArtifact")(name),
 
 	/**
-	 * Attempts to discover the bucket created through bootstrap(), returning the
-	 * bucket name if present.
+	 * The name of the bootstrap bucket, or `false` when none exists yet.
 	 *
-	 * @returns {string} bucketArn
+	 * Discovery is by naming convention rather than by tag, and more than one
+	 * match in the account is an error — there is meant to be exactly one.
+	 *
+	 * @returns {string|boolean} the bucket name, or false
 	 * @example
-	 * local gcp = import "@c6fc/spellcraft-gcp-terraform";
+	 * local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 	 *
-	 * gcp.getBootstrapBucket();
-	 *
-	 * // Returns:
-	 * spellcraft-terraform-<project-id>
+	 * { "state.json": { bucket: aws.getBootstrapBucket() } }
 	 */
-	getBootstrapBucket():: std.native("@c6fc/spellcraft-gcp-terraform:getBootstrapBucket")(),
+	getBootstrapBucket():: std.native("@c6fc/spellcraft-aws-terraform:getBootstrapBucket")(),
 
 	/**
-	 * Read the Terraform state for an adjacent SpellCraft project in the same GCP account
+	 * Reads the Terraform state of another SpellCraft project in the same account.
 	 *
-	 * @param {string} project
-	 * @returns {object} state
+	 * Use it to consume another spell's outputs at evaluation time. The project
+	 * name is the one passed to that spell's `bootstrap()`.
+	 *
+	 * @param {string} project - the other spell's project name
+	 * @returns {object} that project's Terraform state
 	 * @example
-	 * local gcp = import "@c6fc/spellcraft-gcp-terraform";
+	 * local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 	 *
-	 * gcp.getRemoteState("mySecondProject");
+	 * local network = aws.getRemoteState("network");
 	 *
-	 * // Returns:
-	 * { full remote state object }
+	 * { "app.tf.json": { output: { vpc: { value: network.outputs.vpc_id.value } } } }
 	 */
-	getRemoteState(project):: std.native("@c6fc/spellcraft-gcp-terraform:getRemoteState")(project),
+	getRemoteState(project):: std.native("@c6fc/spellcraft-aws-terraform:getRemoteState")(project),
 
 	/**
-	 * Creates a given folder and project structure, exposing provider aliases
-	 * for later use. See test.jsonnet for reference.
-	 * 
-	 * @param {string} name
-	 * @param {string} region
-	 * @param {object} map
-	 */
-	googleOrgProject(name, region, map):: projectAnchor(name, region, map),
-
-	/**
-	 * Stores the JSON-encoded balue of 'contents' as a file in the GCS backend bucket using
-	 * the project prefix.
+	 * Stores a value as a JSON artifact in the bootstrap bucket, under this
+	 * project's prefix. Read it back with `getArtifact()`.
 	 *
-	 * @param {string} name
-	 * @param {*} contents
+	 * Throws if `bootstrap()` hasn't set a project name yet -- see `bootstrap()`
+	 * for why that ordering isn't automatic.
+	 *
+	 * @param {string} name - the artifact name
+	 * @param {*} content - any JSON-serialisable value
 	 * @returns {boolean} true
 	 * @example
-	 * local gcp = import "@c6fc/spellcraft-gcp-terraform";
+	 * local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 	 *
-	 * gcp.putArtifact("myArtifact", { someData: someValue });
+	 * local backend = aws.bootstrap("my-project");
 	 *
-	 * // Returns:
-	 * true
+	 * {
+	 *     "backend.tf.json": backend,
+	 *     "meta.json": { stored: if backend != null then aws.putArtifact("network", { subnetId: "subnet-abc123" }) else null },
+	 * }
 	 */
-	putArtifact(name, content):: std.native("@c6fc/spellcraft-gcp-terraform:putArtifact")(name, content),
+	putArtifact(name, content):: std.native("@c6fc/spellcraft-aws-terraform:putArtifact")(name, content),
 
 	/**
-	 * Stores the JSON-encoded value of 'contents' as a file in the GCS backend bucket using
-	 * the project prefix. If 'filter' is provided, only region names that string match
-	 * will be included.
+	 * Builds the full set of AWS provider declarations for a spell.
 	 *
-	 * @param {string} default
-	 * @param {string} options
-	 * @param {string} filter
+	 * Returns one aliased provider per region your credentials can see — the
+	 * alias is the region name, so resources bind to it as `aws.us-west-2` — plus
+	 * an unaliased default provider for the region you name. This is what lets
+	 * plugins like `@c6fc/spellcraft-aws-s3` take a region as an argument and
+	 * place resources in it without every spell wiring providers by hand.
+	 *
+	 * The region list comes from a live `describeRegions` call, so the set
+	 * reflects what the account actually has enabled.
+	 *
+	 * @param {string} default - region for the unaliased default provider
+	 * @returns {object[]} provider declarations, for the `provider` key of a `.tf.json`
 	 * @example
-	 * local gcp = import "@c6fc/spellcraft-gcp-terraform";
+	 * local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 	 *
-	 * gcp.providerAliases("us-west2", {},  "us-");
+	 * { "providers.tf.json": { provider: aws.providerAliases("us-east-2") } }
 	 *
 	 * // Returns:
-	 * [{ google: {
-	 *		region: "us-west2"
-	 * }}, { google: {
-	 *		region: "us-east1",
-			alias: "us-east1"
-	 * }}, ...]
+	 * // [
+	 * //   { "aws": { "alias": "us-east-1", "region": "us-east-1" } },
+	 * //   { "aws": { "alias": "us-west-2", "region": "us-west-2" } },
+	 * //   ...
+	 * //   { "aws": { "region": "us-east-2" } }
+	 * // ]
 	 */
-	providerAliases(default, options, filter=""):: [{
-		google: options + {
+	providerAliases(default):: [{
+		aws: {
 			alias: region,
 			region: region
 		}
-	} for region in std.filterMap(
-		function(x) filter != false && (std.length(filter) < 1 || std.length(std.findSubstr(filter, x.name)) > 0),
-		function(x) x.name,
-		std.native("@c6fc/spellcraft-gcp-auth:api")('compute.v1.regions.list', '{"project":"%s"}' % std.native("@c6fc/spellcraft-gcp-auth:getProjectId")()).items
+	} for region in std.map(
+		function(x) x.RegionName,
+		std.native("@c6fc/spellcraft-aws-auth:aws")('{ "service": "EC2", "params": { "region": "us-east-1" } }', "describeRegions", "{}").Regions
 	)] + [{
-		google: options + {
+		aws: {
 			region: default
 		}
 	}]

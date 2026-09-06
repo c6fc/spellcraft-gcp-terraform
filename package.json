@@ -4,7 +4,8 @@
   "main": "module.js",
   "scripts": {
     "cli": "utils/cli-test.js",
-    "test": "node utils/test.js"
+    "test": "node utils/test.js",
+    "doc": "spellcraft doc"
   },
   "repository": {
     "type": "git",

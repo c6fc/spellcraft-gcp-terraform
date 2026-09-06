@@ -1,241 +1,352 @@
-# SpellCraft GCP Integration
+# @c6fc/spellcraft-aws-terraform
 
-[![NPM version](https://img.shields.io/npm/v/@c6fc/spellcraft-gcp-terraform.svg?style=flat)](https://www.npmjs.com/package/@c6fc/spellcraft-gcp-terraform)
-[![License](https://img.shields.io/npm/l/@c6fc/spellcraft-gcp-terraform.svg?style=flat)](https://opensource.org/licenses/MIT)
+S3 state backend, remote state, artifacts and provider aliases for
+[SpellCraft](https://github.com/c6fc/spellcraft).
 
-This module exposes common constructs for using [SpellCraft](https://github.com/@c6fc/spellcraft) SpellFrames to deploy infrastructure to GCP using Terraform.
+[![NPM version](https://img.shields.io/npm/v/@c6fc/spellcraft-aws-terraform.svg?style=flat)](https://www.npmjs.com/package/@c6fc/spellcraft-aws-terraform)
+[![License](https://img.shields.io/npm/l/@c6fc/spellcraft-aws-terraform.svg?style=flat)](https://opensource.org/licenses/MIT)
 
-```sh
-npm install --save @c6fc/spellcraft-gcp-terraform
+This is the AWS half of the Terraform story: it decides where state lives, hands
+one spell the values another produced, and declares the providers that
+region-aware plugins bind to. `@c6fc/spellcraft-terraform` runs the apply;
+this tells it what to apply against.
+
+```bash
+npm install --save @c6fc/spellcraft-aws-terraform @c6fc/spellcraft-terraform
 ```
 
-## Features
-
-This module exposes the concept of a bootstrap bucket (functionally a terraform backend), and artifacts which can contain arbitrary data and are stored alongside the terraform state in the bootstrap bucket. The former allows for dynamic configuration of Terraform providers within different environments, while the latter simplifies the storage and use of dynamic configuration details that might be environment dependent.
-
-<!-- SPELLCRAFT_DOCS_CLI_START -->
-
-<!-- SPELLCRAFT_DOCS_CLI_END -->
-
-## SpellFrame 'init()' features
-
-This plugin registers a custom hook during `init()` on the `SpellFrame` instance. It listens to namespaced events from `@c6fc/spellcraft-terraform`:
-
-- **Deferred Service Enablement Registry**: When GCP services are declared in Jsonnet via `enableServices()`, they are not enabled immediately during manifestation. Instead, they are collected in an in-memory registry. When the `@c6fc/spellcraft-terraform:pre-apply` event is fired (right before Terraform runs), all accumulated services are enabled in a single batched GCP API invocation, preventing API latency from slowing down local rendering iterations.
+## A complete spell
 
 ```jsonnet
-local gcp = import "@c6fc/spellcraft-gcp-terraform";
+local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
+local s3 = import "@c6fc/spellcraft-aws-s3/module.libsonnet";
 
-# An instance of @c6fc/spellcraft-gcp-auth
-gcp.auth;
+{
+	// State backend, and the bucket to hold it. Created on first use.
+	"backend.tf.json": aws.bootstrap("my-project"),
+
+	// One aliased provider per region, plus an unaliased default.
+	"providers.tf.json": { provider: aws.providerAliases("us-east-1") },
+
+	"buckets.tf.json": s3.bucket("artifacts", "us-west-2"),
+}
 ```
 
-## JavaScript context features
+```bash
+npx spellcraft terraform-apply manifest.jsonnet
+```
 
-Extends the JavaScript function context with an `gcpterraform` object containing the following keys:
+Three things happen before Terraform sees anything: credentials resolve, the
+backend bucket is created if it is missing, and the region list is fetched to
+build the providers. The rendered `.tf.json` already contains the answers.
 
-```JSON
-{ 
-	"projectName": "<contains the name of the project specified by bootstrap()>",
-	"bootstrapBucket": "<contains the name for the bootstrap bucket>",
+## The bootstrap bucket
+
+`bootstrap(project)` returns the Terraform `backend` block and makes sure the
+bucket behind it exists. There is **one bucket per account**, discovered by
+naming convention — `spellcraft-<random>-<digits>` — and shared by every spell,
+which is why `project` is a required argument: it becomes the key prefix that
+separates one spell's state from another's.
+
+Finding more than one candidate bucket is an error rather than a guess.
+
+`getArtifact()` and `putArtifact()` (below) both key their object off the
+project name `bootstrap()` records, so either one throws if it runs before
+some `bootstrap()` call has set it. Jsonnet doesn't otherwise guarantee that
+order — see the warning under "Sharing values between spells" for how to make
+it explicit.
+
+### Skipping bootstrap() entirely
+
+Not every spell needs its project name computed at render time. If it's
+known ahead of time, set it in `package.json` instead:
+
+```json
+{
+	"config": {
+		"spellcraftProject": "my-project"
+	}
 }
+```
+
+This bootstraps during `init()` — before any Jsonnet evaluation starts — so
+there's no ordering hazard to navigate at all: no threading a return value
+through, no risk of `getArtifact()`/`putArtifact()` running first. It also
+sidesteps a subtler hazard entirely: `bootstrap()`'s state lives in a
+module-level object shared by every `SpellFrame` in the process, so two
+renders for two different projects running concurrently (embedding
+`SpellFrame` as a library, rather than one process per `spellcraft` CLI
+invocation) could otherwise cross-contaminate. A config-driven project name
+is the same for every render in that process, so there's nothing left to
+race on.
+
+`config.spellcraftProject` and an explicit `bootstrap()` call are mutually
+exclusive — set the former and the latter throws, rather than risking the
+two silently disagreeing about which project is live.
+
+## Sharing values between spells
+
+Two ways, both resolved while the manifest evaluates rather than at apply time.
+
+**Remote state** reads another spell's outputs:
+
+```jsonnet
+local network = aws.getRemoteState("network");
+
+{
+	"app.tf.json": {
+		resource: {
+			aws_instance: {
+				app: { subnet_id: network.outputs.subnet_id.value },
+			},
+		},
+	},
+}
+```
+
+**Artifacts** are arbitrary JSON values written under a project's prefix,
+for things that aren't Terraform outputs at all. Unlike `getRemoteState()`,
+they use *this* spell's own project — the one passed to `bootstrap()` — so
+`bootstrap()` has to run first:
+
+```jsonnet
+local backend = aws.bootstrap("my-project");
+
+{
+	"backend.tf.json": backend,
+	"meta.json": { ok: if backend != null then aws.putArtifact("build", { image: "app:1.4.2" }) else null },
+}
+```
+
+```jsonnet
+local build = aws.getArtifact("build");
+```
+
+Jsonnet evaluates lazily and in no guaranteed field order, so merely calling
+`bootstrap()` somewhere in the manifest doesn't make it run before
+`putArtifact()`/`getArtifact()` elsewhere in the same manifest — the call that
+needs it has to *depend on* the result, as `if backend != null then ...`
+does above, not merely follow it. Get this wrong and `putArtifact()` /
+`getArtifact()` throw naming the fix, rather than silently writing to
+`spellcraft/false/artifacts/<name>`.
+
+Because both land during evaluation, the value can *shape* the configuration —
+choosing how many resources to emit, or which branch to take — not merely appear
+inside it. A Terraform data source can only do the latter.
+
+## Provider aliases
+
+`providerAliases(default)` emits an aliased `aws` provider for every region the
+account has enabled, with the alias set to the region name, plus an unaliased
+default for the region you name. Plugins then take a region as an argument and
+bind to `aws.<region>` without any per-spell wiring.
+
+It is also the reason a spell only declares providers once, no matter how many
+region-aware plugins it uses.
+
+## The auth passthrough
+
+`aws.auth` re-exports [`@c6fc/spellcraft-aws-auth`](https://www.npmjs.com/package/@c6fc/spellcraft-aws-auth),
+so a spell that already imports this module can reach the credential helpers
+without a second import:
+
+```jsonnet
+{ "identity.json": aws.auth.getCallerIdentity() }
 ```
 
 <!-- SPELLCRAFT_DOCS_API_START -->
 ## API Reference
 
-### `enableServices(services)`
-
-Registers a list of GCP services/APIs to be enabled. Rather than enabling them immediately (which slows down rendering), this function registers them in an in-memory registry, which is subsequently activated in a single batched call when the `@c6fc/spellcraft-terraform:pre-apply` event triggers.
-
-- param {array} services - Array of service names to enable (e.g. `["orgpolicy.googleapis.com"]`).
-- returns {boolean} true
-
-**Examples:**
-
-```jsonnet
-local gcp = import "@c6fc/spellcraft-gcp-terraform";
-
-gcp.enableServices(["orgpolicy.googleapis.com"]);
-```
-
----
 ### `bootstrap(project)`
 
-Creates a Terraform backend bucket if one doesn't already exist, then
-returns a 'backend' object referencing this bucket and a unique path
-for this project's state and artifacts.
+Prepares the S3 backend for a project, creating the bootstrap bucket if it
+does not exist yet, and returns the Terraform `backend` block for it.
 
-- param {string} project
-- returns {object} backend
+This is the one function here that writes: it creates the bucket on first
+use. State and artifacts for every project live in that one bucket, keyed
+by project name.
+
+`getArtifact()` and `putArtifact()` key their object off the project name
+this sets, so either one throws if it runs before this has. Jsonnet does
+not guarantee that order on its own -- thread this function's result into
+whatever calls them, the way `enableServices()` is threaded elsewhere in
+this ecosystem, rather than merely calling both in the same manifest.
+
+A spell that only ever bootstraps one project, known ahead of time, can
+skip calling this from Jsonnet at all: set `config.spellcraftProject` in
+`package.json` and it runs during `init()`, before evaluation starts, so
+there's no ordering hazard to think about. The two are mutually
+exclusive -- calling this explicitly throws if `config.spellcraftProject`
+already bootstrapped the spell, rather than letting the two silently
+disagree about which project is live.
+
+A spell has one project. Calling this again with a *different* name in
+the same process throws for the same reason -- to read another spell's
+state, use `getRemoteState()`, not a second `bootstrap()` call. The
+same name twice is a no-op.
+
+- param {string} project - names the state prefix; use one per spell
+- returns {object} a Terraform block ready to merge into a `.tf.json` file
 
 **Examples:**
 
 ```jsonnet
-local gcp = import "@c6fc/spellcraft-gcp-terraform";
+local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 
-gcp.bootstrap("myBootstrapTest");
+{ "backend.tf.json": aws.bootstrap("my-project") }
 
 // Returns:
-{
-   "terraform": {
-       "backend": {
-           "gcs": {
-               "bucket": "spellcraft-random-0123456789",
-               "key": "spellcraft/myBootstrapTest/terraform.tfstate",
-           }
-       }
-   }
-}
+// {
+//   "terraform": {
+//     "backend": {
+//       "s3": {
+//         "bucket": "spellcraft-random-0123456789",
+//         "key": "spellcraft/my-project/terraform.tfstate",
+//         "region": "us-east-1"
+//       }
+//     }
+//   }
+// }
 ```
 
 ---
 ### `getArtifact(name)`
 
-Obtains the contents of a named artifact stored alongside this project in the bootstrap
-bucket. This artifact is created with 'putArtifact';
+Reads an artifact previously stored by `putArtifact()`.
 
-- param {string} name
-- returns {object} backend
+Artifacts are how one spell hands a value to another without a Terraform
+data source — the value is fetched while the manifest evaluates, so it can
+shape the configuration rather than only appear in it.
+
+Throws if `bootstrap()` hasn't set a project name yet -- see `bootstrap()`
+for why that ordering isn't automatic.
+
+- param {string} name - the artifact name given to `putArtifact()`
+- returns {*} the stored value, parsed back from JSON
 
 **Examples:**
 
 ```jsonnet
-local gcp = import "@c6fc/spellcraft-gcp-terraform";
+local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 
-gcp.getArtifact("myArtifact");
+local backend = aws.bootstrap("my-project");
+local shared = if backend != null then aws.getArtifact("network") else null;
 
-// Returns:
-<contents of your artifact>
+{ "app.tf.json": { resource: { aws_instance: { app: { subnet_id: shared.subnetId } } } } }
 ```
 
 ---
 ### `getBootstrapBucket()`
 
-Attempts to discover the bucket created through bootstrap(), returning the
-bucket name if present.
+The name of the bootstrap bucket, or `false` when none exists yet.
 
-- returns {string} bucketArn
+Discovery is by naming convention rather than by tag, and more than one
+match in the account is an error — there is meant to be exactly one.
+
+- returns {string|boolean} the bucket name, or false
 
 **Examples:**
 
 ```jsonnet
-local gcp = import "@c6fc/spellcraft-gcp-terraform";
+local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 
-gcp.getBootstrapBucket();
-
-// Returns:
-spellcraft-terraform-<project-id>
+{ "state.json": { bucket: aws.getBootstrapBucket() } }
 ```
 
 ---
 ### `getRemoteState(project)`
 
-Read the Terraform state for an adjacent SpellCraft project in the same GCP account
+Reads the Terraform state of another SpellCraft project in the same account.
 
-- param {string} project
-- returns {object} state
+Use it to consume another spell's outputs at evaluation time. The project
+name is the one passed to that spell's `bootstrap()`.
+
+- param {string} project - the other spell's project name
+- returns {object} that project's Terraform state
 
 **Examples:**
 
 ```jsonnet
-local gcp = import "@c6fc/spellcraft-gcp-terraform";
+local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 
-gcp.getRemoteState("mySecondProject");
+local network = aws.getRemoteState("network");
 
-// Returns:
-{ full remote state object }
+{ "app.tf.json": { output: { vpc: { value: network.outputs.vpc_id.value } } } }
 ```
 
 ---
 ### `putArtifact(name, content)`
 
-Stores the JSON-encoded balue of 'contents' as a file in the GCS backend bucket using
-the project prefix.
+Stores a value as a JSON artifact in the bootstrap bucket, under this
+project's prefix. Read it back with `getArtifact()`.
 
-- param {string} name
-- param {*} contents
+Throws if `bootstrap()` hasn't set a project name yet -- see `bootstrap()`
+for why that ordering isn't automatic.
+
+- param {string} name - the artifact name
+- param {*} content - any JSON-serialisable value
 - returns {boolean} true
 
 **Examples:**
 
 ```jsonnet
-local gcp = import "@c6fc/spellcraft-gcp-terraform";
+local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 
-gcp.putArtifact("myArtifact", { someData: someValue });
+local backend = aws.bootstrap("my-project");
 
-// Returns:
-true
+{
+    "backend.tf.json": backend,
+    "meta.json": { stored: if backend != null then aws.putArtifact("network", { subnetId: "subnet-abc123" }) else null },
+}
 ```
 
 ---
-### `googleOrgProject(name, region, map)`
+### `providerAliases(default)`
 
-Creates a given folder and project hierarchy in GCP and returns the set of Terraform resources (folders, projects, IAM policies, service accounts, custom roles, etc.).
+Builds the full set of AWS provider declarations for a spell.
 
-- param {string} name - The anchor name for the organization hierarchy.
-- param {string} region - The default region.
-- param {object} map - The tree structure defining folders and projects (see `test.jsonnet` for full schema/example).
+Returns one aliased provider per region your credentials can see — the
+alias is the region name, so resources bind to it as `aws.us-west-2` — plus
+an unaliased default provider for the region you name. This is what lets
+plugins like `@c6fc/spellcraft-aws-s3` take a region as an argument and
+place resources in it without every spell wiring providers by hand.
 
-#### Dependency & Ordering Features:
-- **Service Enablement Ordering:** Resources created within a project (e.g., service accounts, custom roles, IAM policies) automatically receive a `depends_on` targeting that project's service activation resources (`terraform_data.<project-name>-service-depends`). This guarantees they wait until the project's APIs/services are enabled.
-- **Post-Everything Dependency:** An automatic `terraform_data.<name>-org-complete` resource is generated. It has a `depends_on` array containing every resource created in the module hierarchy. You can use this to create manual dependencies in your own files:
-  ```jsonnet
-  my_resource: {
-      depends_on: ["terraform_data.test-org-complete"]
-  }
-  ```
+The region list comes from a live `describeRegions` call, so the set
+reflects what the account actually has enabled.
 
----
-### `providerAliases(default, filter="")`
-
-Stores the JSON-encoded value of 'contents' as a file in the GCS backend bucket using
-the project prefix. If 'filter' is provided, only region names that string match
-will be included.
-
-- param {string} default
-- param {string} filter
+- param {string} default - region for the unaliased default provider
+- returns {object[]} provider declarations, for the `provider` key of a `.tf.json`
 
 **Examples:**
 
 ```jsonnet
-local gcp = import "@c6fc/spellcraft-gcp-terraform";
+local aws = import "@c6fc/spellcraft-aws-terraform/module.libsonnet";
 
-gcp.providerAliases("us-west2");
+{ "providers.tf.json": { provider: aws.providerAliases("us-east-2") } }
 
 // Returns:
-[{ google: {
-	region: "us-west2"
-}}, { google: {
-	region: "us-east1",
-	alias: "us-east1"
-}}, ...]
+// [
+//   { "aws": { "alias": "us-east-1", "region": "us-east-1" } },
+//   { "aws": { "alias": "us-west-2", "region": "us-west-2" } },
+//   ...
+//   { "aws": { "region": "us-east-2" } }
+// ]
 ```
 
 ---
 
 <!-- SPELLCRAFT_DOCS_API_END -->
 
-
-## Installation
-
-Install the plugin as a dependency in your SpellCraft project:
+## Development
 
 ```bash
-npm install --save @c6fc/spellcraft-gcp-terraform
+npm test        # renders test.jsonnet through a real SpellFrame
+npm run doc     # regenerates the API section above from module.libsonnet
 ```
 
-Once installed, you can load the module into your JSonnet files.
+`npm test` **writes**: it creates the bootstrap bucket if your account has none,
+and stores an artifact in it.
 
-```jsonnet
-local aws = import "@c6fc/spellcraft-gcp-terraform";
+## License
 
-{
-	'backend.tf.json': aws.bootstrap("myProjectName"),
-
-	// Generate provider list defaulting to 'us-west2' but including all 'us-' regions
-	'provider.tf.json': {
-		provider: aws.providerAliases("us-west2", "us-")
-	}
-}
-```
+MIT © [Brad Woodward](https://github.com/c6fc)
