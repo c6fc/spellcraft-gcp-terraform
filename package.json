@@ -1,10 +1,11 @@
 {
   "name": "@c6fc/spellcraft-gcp-terraform",
-  "version": "1.0.3",
+  "version": "2.0.0",
   "main": "module.js",
   "scripts": {
     "cli": "utils/cli-test.js",
-    "test": "node utils/test.js"
+    "test": "node utils/test.js",
+    "doc": "spellcraft doc"
   },
   "repository": {
     "type": "git",
@@ -22,18 +23,28 @@
     "url": "https://github.com/c6fc/spellcraft-gcp-terraform/issues"
   },
   "homepage": "https://github.com/c6fc/spellcraft-gcp-terraform#readme",
-  "description": "A plugin to empower @c6fc/spellcraft with GCP and Terraform",
+  "description": "GCS state backend, remote state and artifacts, plus googleOrgProject for whole org and project trees.",
   "dependencies": {
-    "@c6fc/spellcraft-gcp-auth": "^1.0.1",
-    "@c6fc/spellcraft-terraform": "^1.1.3",
+    "@c6fc/spellcraft-gcp-auth": "^2.0.0",
+    "@c6fc/spellcraft-terraform": "^2.0.0",
     "@inquirer/prompts": "^8.3.2",
     "@inquirer/search": "^4.1.6"
   },
   "devDependencies": {
-    "@c6fc/spellcraft": "~0.1.0",
+    "@c6fc/spellcraft": "^1.0.0",
     "yargs": "^18.0.0"
   },
   "peerDependencies": {
-    "@c6fc/spellcraft": "~0.1.0"
-  }
+    "@c6fc/spellcraft": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "module.js",
+    "module.libsonnet",
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md"
+  ]
 }

@@ -8,12 +8,18 @@ local gcp = import "module.libsonnet";
 local domain = gcp.auth.getProjectMetadata().organizationDomain;
 local directoryId = gcp.auth.getProjectMetadata().directoryId;
 
+// putArtifact() keys its object off the project name bootstrap() sets, and
+// Jsonnet doesn't guarantee bootstrap() runs first just because it's written
+// first -- binding it to a local and depending on that value (below) is what
+// actually forces the order.
+local bootstrap = gcp.bootstrap("spellcraft-gcp-terraform-module-test");
+
 {
-	"bootstrap.tf.json": gcp.bootstrap("spellcraft-gcp-terraform-module-test"),
+	"bootstrap.tf.json": bootstrap,
 	"test.tf.json": {
 		output: {
 			putArtifact: {
-				value: gcp.putArtifact("putArtifactTest", "mytest2")
+				value: if bootstrap != null then gcp.putArtifact("putArtifactTest", "mytest2") else null
 			},
 			getBootstrapBucket: {
 				value: gcp.getBootstrapBucket()
@@ -29,12 +35,12 @@ local directoryId = gcp.auth.getProjectMetadata().directoryId;
 			*/
 		}
 	},
-	"projectAnchor.tf.json": gcp.googleOrgProject("test", "us-west2", {
+	"projectStructure.tf.json": gcp.googleOrgProject("test", "us-west2", {
 		type: "folder",
-		name: "orgfoldertest",
+		name: "folder1",
 		children: [{
 			type: "folder",
-			name: "orgfoldertest2",
+			name: "folder2",
 
 			iam_members: [{
 				role: "roles/resourcemanager.folderAdmin",
@@ -50,7 +56,7 @@ local directoryId = gcp.auth.getProjectMetadata().directoryId;
 
 			children: [{
 				type: "project",
-				name: "orgprojecttest",
+				name: "project1",
 				provider_regions: ["us-central1"],
 
 				audit_config: {
